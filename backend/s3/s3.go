@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4signer "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
@@ -1170,6 +1171,10 @@ type Fs struct {
 	versioningMu   sync.Mutex
 	versioning     fs.Tristate // if set bucket is using versions
 	warnCompressed sync.Once   // warn once about compressed files
+
+	// Immutable safety assertions for the constructed HTTP and SDK clients.
+	urlFetchLogSafe     bool
+	urlFetchRequestSafe bool
 }
 
 // Object describes a s3 object
@@ -1259,6 +1264,435 @@ func (f *Fs) String() string {
 // Features returns the optional features of this Fs
 func (f *Fs) Features() *fs.Features {
 	return f.features
+}
+
+const (
+	directFetchSourceHeader   = "fastly-object-storage-source-url"
+	directFetchErrorHeader    = "fastly-object-storage-df-error"
+	directFetchMaxSize        = int64(5_000_000_000)
+	directFetchCleanupTimeout = 60 * time.Second
+)
+
+type directFetchRange struct {
+	start int64
+	end   int64
+}
+
+func directFetchRanges(size int64, chunkSize fs.SizeSuffix, maxParts int) ([]directFetchRange, error) {
+	if size <= 0 {
+		return nil, fs.ErrorCantCopy
+	}
+	limit := max(1, min(maxParts, maxUploadParts))
+	partSize := min(max(int64(chunkSize), int64(minChunkSize)), directFetchMaxSize)
+	required := 1 + (size-1)/int64(limit)
+	partSize = max(partSize, required)
+	if partSize > directFetchMaxSize {
+		return nil, fs.ErrorCantCopy
+	}
+	count := 1 + (size-1)/partSize
+	ranges := make([]directFetchRange, int(count))
+	offset := int64(0)
+	for i := range ranges {
+		length := min(partSize, size-offset)
+		ranges[i] = directFetchRange{start: offset, end: offset + length - 1}
+		offset += length
+	}
+	return ranges, nil
+}
+
+var (
+	directFetchURLPattern    = regexp.MustCompile(`(?i)https?(?::|%3a)(?:/|%2f){2}[^\s<>"']+`)
+	directFetchSourceStatus  = regexp.MustCompile(`^DirectFetchSourceStatus ([1-5][0-9]{2})$`)
+	directFetchNullAccounter = transferaccounter.Get(context.Background())
+)
+
+// directFetchError renders safe Direct Fetch diagnostics while retaining the
+// original SDK error for errors.Is and errors.As.
+type directFetchError struct {
+	operation string
+	sourceURL string
+	code      string
+	message   string
+	detail    string
+	requestID string
+	status    int
+	cause     error
+}
+
+func (e *directFetchError) Error() string {
+	cleanStructural := func(text string) string { return safeDirectFetchText(text, e.sourceURL, false) }
+	cleanDiagnostic := func(text string) string { return safeDirectFetchText(text, e.sourceURL, true) }
+	return fmt.Sprintf("direct fetch %s (HTTP %d, code %q, request %q): %s; %s",
+		cleanStructural(e.operation), e.status, cleanStructural(e.code), cleanStructural(e.requestID),
+		cleanDiagnostic(e.message), cleanDiagnostic(e.detail))
+}
+
+func (e *directFetchError) Unwrap() error {
+	return e.cause
+}
+
+func directFetchOptions(sourceURL, byteRange string) func(*s3.Options) {
+	return func(options *s3.Options) {
+		options.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		options.APIOptions = append(options.APIOptions, smithyhttp.SetHeaderValue(directFetchSourceHeader, sourceURL))
+		if byteRange != "" {
+			options.APIOptions = append(options.APIOptions, smithyhttp.SetHeaderValue("Range", byteRange))
+		}
+	}
+}
+
+func directFetchCredentialQueryKey(key string) bool {
+	key = strings.ToLower(key)
+	return key == "sig" || strings.Contains(key, "credential") || strings.Contains(key, "signature") ||
+		strings.Contains(key, "token") || strings.Contains(key, "secret") || strings.Contains(key, "password")
+}
+
+func safeDirectFetchText(text, sourceURL string, redactCredentialComponents bool) string {
+	if sourceURL != "" {
+		for _, form := range []string{sourceURL, url.QueryEscape(sourceURL), url.PathEscape(sourceURL)} {
+			if form != "" {
+				text = strings.ReplaceAll(text, form, "[redacted URL]")
+			}
+		}
+	}
+	text = directFetchURLPattern.ReplaceAllString(text, "[redacted URL]")
+	if redactCredentialComponents && sourceURL != "" {
+		if parsed, err := url.Parse(sourceURL); err == nil {
+			for key, values := range parsed.Query() {
+				if !directFetchCredentialQueryKey(key) {
+					continue
+				}
+				for _, value := range values {
+					for _, form := range []string{value, url.QueryEscape(value), url.PathEscape(value)} {
+						if form != "" {
+							text = strings.ReplaceAll(text, form, "[redacted URL]")
+						}
+					}
+				}
+			}
+		}
+	}
+	text = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, strings.ToValidUTF8(text, "?"))
+	runes := []rune(text)
+	if len(runes) > 1024 {
+		text = string(runes[:1024]) + "…"
+	}
+	return text
+}
+
+func wrapDirectFetchError(operation, sourceURL string, err error) error {
+	if err == nil {
+		return nil
+	}
+	directErr := &directFetchError{
+		operation: operation,
+		sourceURL: sourceURL,
+		cause:     err,
+		message:   err.Error(),
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		directErr.code = apiErr.ErrorCode()
+		directErr.message = apiErr.ErrorMessage()
+	}
+	var responseErr interface{ HTTPResponse() *smithyhttp.Response }
+	if errors.As(err, &responseErr) {
+		response := responseErr.HTTPResponse()
+		if response != nil && response.Response != nil {
+			directErr.status = response.StatusCode
+			directErr.detail = response.Header.Get(directFetchErrorHeader)
+			directErr.requestID = response.Header.Get("x-amz-request-id")
+		}
+	}
+	return directErr
+}
+
+func directFetchFallback(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	var directErr *directFetchError
+	if errors.As(err, &directErr) &&
+		(directErr.operation == "PutObject" || directErr.operation == "UploadPart") &&
+		directErr.status == http.StatusBadRequest && directErr.code == "DirectFetchSourceStatus" &&
+		directFetchSourceStatus.MatchString(directErr.detail) {
+		return fmt.Errorf("%w: %w", fs.ErrorCantCopy, err)
+	}
+	return err
+}
+
+func (f *Fs) directFetchCall(ctx context.Context, operation, sourceURL string, call func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.pacer.CallNoRetry(func() (bool, error) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		err := call()
+		if err != nil && ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		err = wrapDirectFetchError(operation, sourceURL, err)
+		return f.shouldRetry(ctx, err)
+	})
+}
+
+// ServerSideFetchURL asks Fastly Object Storage to fetch sourceURL into remote.
+func (f *Fs) ServerSideFetchURL(ctx context.Context, remote, sourceURL string, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	if f.opt.Provider != "Fastly" {
+		return nil, fmt.Errorf("direct fetch is only supported by Fastly Object Storage: %w", fs.ErrorCantCopy)
+	}
+	if f.opt.VersionAt.IsSet() {
+		return nil, errNotWithVersionAt
+	}
+	if f.opt.V2Auth || f.opt.Region == "other-v2-signature" {
+		return nil, errors.New("direct fetch requires AWS Signature Version 4 credentials")
+	}
+	credentialsProvider := f.c.Options().Credentials
+	if credentialsProvider == nil {
+		return nil, errors.New("direct fetch requires configured credentials")
+	}
+	credentials, err := credentialsProvider.Retrieve(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("direct fetch could not retrieve credentials: %w", err)
+	}
+	if !credentials.HasKeys() {
+		return nil, errors.New("direct fetch requires credentials with an access key and secret key")
+	}
+	ci := fs.GetConfig(ctx)
+	if !f.urlFetchLogSafe || !f.urlFetchRequestSafe || ci.Dump != 0 || len(ci.Headers) != 0 || ci.ClientCert != "" || ci.ClientKey != "" {
+		return nil, fmt.Errorf("direct fetch cannot safely use the configured HTTP client: %w", fs.ErrorCantCopy)
+	}
+	if f.opt.NoHead || f.opt.NoHeadObject {
+		return nil, fmt.Errorf("direct fetch requires a destination HEAD request: %w", fs.ErrorCantCopy)
+	}
+	size := src.Size()
+	if size < 0 {
+		return nil, fmt.Errorf("direct fetch requires a known source size: %w", fs.ErrorCantCopy)
+	}
+	parsedSource, err := url.Parse(sourceURL)
+	if err != nil || (parsedSource.Scheme != "http" && parsedSource.Scheme != "https") || parsedSource.Host == "" || parsedSource.User != nil || parsedSource.Fragment != "" {
+		return nil, fmt.Errorf("direct fetch requires an HTTP(S) source URL without user information or a fragment: %w", fs.ErrorCantCopy)
+	}
+
+	o := &Object{fs: f, remote: remote}
+	ui, err := o.prepareUpload(ctx, src, options, true)
+	if err != nil {
+		return nil, err
+	}
+	if f.opt.ObjectLockSetAfterUpload || ui.req.ObjectLockMode != "" || ui.req.ObjectLockRetainUntilDate != nil || ui.req.ObjectLockLegalHoldStatus != "" {
+		return nil, fmt.Errorf("direct fetch does not support requested Object Lock behavior: %w", fs.ErrorCantCopy)
+	}
+	ui.req.Body = nil
+	ui.req.ContentLength = aws.Int64(0)
+	ui.req.ContentMD5 = nil
+	if size > directFetchMaxSize || (size > 0 && size >= int64(f.opt.UploadCutoff)) {
+		versionID, err := o.fetchMultipart(ctx, sourceURL, size, ui.req)
+		if err != nil {
+			return nil, err
+		}
+		return o.finishDirectFetch(ctx, sourceURL, ui.req, versionID)
+	}
+	var out *s3.PutObjectOutput
+	err = f.directFetchCall(ctx, "PutObject", sourceURL, func() error {
+		var callErr error
+		out, callErr = f.c.PutObject(ctx, ui.req, directFetchOptions(sourceURL, ""))
+		return callErr
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, directFetchFallback(err)
+	}
+	if out == nil || out.ETag == nil || *out.ETag == "" {
+		return nil, errors.New("direct fetch PutObject returned no ETag")
+	}
+	return o.finishDirectFetch(ctx, sourceURL, ui.req, out.VersionId)
+}
+
+func (o *Object) fetchMultipart(ctx context.Context, sourceURL string, size int64, req *s3.PutObjectInput) (versionID *string, err error) {
+	ranges, err := directFetchRanges(size, o.fs.opt.ChunkSize, o.fs.opt.MaxUploadParts)
+	if err != nil {
+		return nil, err
+	}
+	concurrency := max(1, o.fs.opt.UploadConcurrency)
+	fs.Debugf(o, "server-side URL fetch: starting multipart upload with %d parts of chunk size %v and concurrency %d", len(ranges), o.fs.opt.ChunkSize, concurrency)
+
+	createReq := &s3.CreateMultipartUploadInput{}
+	setFrom_s3CreateMultipartUploadInput_s3PutObjectInput(createReq, req)
+	var createOut *s3.CreateMultipartUploadOutput
+	err = o.fs.directFetchCall(ctx, "CreateMultipartUpload", sourceURL, func() error {
+		var callErr error
+		createOut, callErr = o.fs.c.CreateMultipartUpload(ctx, createReq)
+		return callErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	if createOut == nil || createOut.UploadId == nil || *createOut.UploadId == "" {
+		return nil, errors.New("direct fetch multipart creation returned no upload ID")
+	}
+	uploadID := createOut.UploadId
+	completed := false
+	defer func() {
+		if completed {
+			return
+		}
+		abortErr := o.fs.abortDirectFetch(ctx, &s3.AbortMultipartUploadInput{
+			Bucket:       req.Bucket,
+			Key:          req.Key,
+			UploadId:     uploadID,
+			RequestPayer: req.RequestPayer,
+		}, sourceURL)
+		if ctx.Err() != nil {
+			err = errors.Join(ctx.Err(), err)
+		}
+		if abortErr != nil {
+			err = errors.Join(err, abortErr)
+			return
+		}
+		if ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			err = directFetchFallback(err)
+		}
+	}()
+
+	parts := make([]types.CompletedPart, len(ranges))
+	account := transferaccounter.Get(ctx)
+	if account != directFetchNullAccounter {
+		account.Start()
+	}
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(concurrency)
+	for i, byteBounds := range ranges {
+		if gCtx.Err() != nil {
+			break
+		}
+		g.Go(func() error {
+			if err := gCtx.Err(); err != nil {
+				return err
+			}
+			byteRange := fmt.Sprintf("bytes=%d-%d", byteBounds.start, byteBounds.end)
+			partSize := byteBounds.end - byteBounds.start + 1
+			fs.Debugf(o, "server-side URL fetch multipart part %d/%d (%s) starting", i+1, len(ranges), byteRange)
+			partNumber := aws.Int32(int32(i + 1))
+			input := &s3.UploadPartInput{
+				Bucket:               req.Bucket,
+				Key:                  req.Key,
+				UploadId:             uploadID,
+				PartNumber:           partNumber,
+				Body:                 nil,
+				ContentLength:        aws.Int64(0),
+				RequestPayer:         req.RequestPayer,
+				SSECustomerAlgorithm: req.SSECustomerAlgorithm,
+				SSECustomerKey:       req.SSECustomerKey,
+				SSECustomerKeyMD5:    req.SSECustomerKeyMD5,
+			}
+			var output *s3.UploadPartOutput
+			err := o.fs.directFetchCall(gCtx, "UploadPart", sourceURL, func() error {
+				var callErr error
+				output, callErr = o.fs.c.UploadPart(gCtx, input, directFetchOptions(sourceURL, byteRange))
+				return callErr
+			})
+			if err != nil {
+				return fmt.Errorf("part %d (%s): %w", i+1, byteRange, err)
+			}
+			if output == nil || output.ETag == nil || *output.ETag == "" {
+				return fmt.Errorf("direct fetch part %d returned no ETag", i+1)
+			}
+			parts[i] = types.CompletedPart{PartNumber: partNumber, ETag: output.ETag}
+			fs.Debugf(o, "server-side URL fetch multipart upload wrote part %d/%d (%s) with %v bytes and etag %v", i+1, len(ranges), byteRange, partSize, *output.ETag)
+			account.Add(partSize)
+			return nil
+		})
+	}
+	if err = g.Wait(); err != nil {
+		return nil, err
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+	for i := range parts {
+		if parts[i].PartNumber == nil || parts[i].ETag == nil || *parts[i].ETag == "" {
+			return nil, fmt.Errorf("direct fetch part %d has no completion data", i+1)
+		}
+	}
+
+	completeReq := &s3.CompleteMultipartUploadInput{
+		Bucket: req.Bucket,
+		Key:    req.Key,
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: parts,
+		},
+		RequestPayer:         req.RequestPayer,
+		SSECustomerAlgorithm: req.SSECustomerAlgorithm,
+		SSECustomerKey:       req.SSECustomerKey,
+		SSECustomerKeyMD5:    req.SSECustomerKeyMD5,
+		UploadId:             uploadID,
+		IfMatch:              req.IfMatch,
+		IfNoneMatch:          req.IfNoneMatch,
+	}
+	var completeOut *s3.CompleteMultipartUploadOutput
+	err = o.fs.directFetchCall(ctx, "CompleteMultipartUpload", sourceURL, func() error {
+		var callErr error
+		completeOut, callErr = o.fs.c.CompleteMultipartUpload(ctx, completeReq)
+		return callErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	if completeOut == nil || completeOut.ETag == nil || *completeOut.ETag == "" {
+		return nil, errors.New("direct fetch multipart completion returned no ETag")
+	}
+	completed = true
+	fs.Debugf(o, "server-side URL fetch multipart upload finished")
+	return completeOut.VersionId, nil
+}
+
+func (f *Fs) abortDirectFetch(ctx context.Context, req *s3.AbortMultipartUploadInput, sourceURL string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), directFetchCleanupTimeout)
+	defer cancel()
+	_, err := f.c.AbortMultipartUpload(cleanupCtx, req)
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchUpload" {
+		return nil
+	}
+	return wrapDirectFetchError("AbortMultipartUpload", sourceURL, err)
+}
+
+func (o *Object) finishDirectFetch(ctx context.Context, sourceURL string, req *s3.PutObjectInput, versionID *string) (fs.Object, error) {
+	input := &s3.HeadObjectInput{
+		Bucket:               req.Bucket,
+		Key:                  req.Key,
+		VersionId:            versionID,
+		RequestPayer:         req.RequestPayer,
+		SSECustomerAlgorithm: req.SSECustomerAlgorithm,
+		SSECustomerKey:       req.SSECustomerKey,
+		SSECustomerKeyMD5:    req.SSECustomerKeyMD5,
+	}
+	var head *s3.HeadObjectOutput
+	err := o.fs.directFetchCall(ctx, "HeadObject", sourceURL, func() error {
+		var callErr error
+		head, callErr = o.fs.c.HeadObject(ctx, input)
+		return callErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	if head == nil || head.ContentLength == nil || *head.ContentLength < 0 {
+		return nil, errors.New("direct fetch HEAD returned no usable object size")
+	}
+	o.setMetaData(head)
+	if o.fs.opt.Versions {
+		o.versionID = versionID
+	}
+	return o, nil
 }
 
 // retryErrorCodes is a slice of error codes that we will retry
@@ -1360,6 +1794,7 @@ func getClient(ctx context.Context, opt *Options) *http.Client {
 // on a scheme downgrade, and has no knowledge that the SSE-C headers hold raw
 // encryption keys, so we strip them all ourselves.
 var s3RedirectSecretHeaders = []string{
+	"Fastly-Object-Storage-Source-Url",
 	"X-Amz-Security-Token",  // AWS STS session token
 	"X-Amz-S3session-Token", // S3 Express (directory bucket) session token
 	"Authorization",         // e.g. IBM IAM bearer token
@@ -1819,6 +2254,20 @@ func (f *Fs) setRoot(root string) {
 	f.rootBucket, f.rootDirectory = bucket.Split(f.root)
 }
 
+// supportsDirectPublicLink reports whether URL-only downloads preserve logical bytes.
+func (f *Fs) supportsDirectPublicLink() bool {
+	o := &f.opt
+	return (o.Provider == "AWS" || o.Provider == "Fastly") &&
+		f.urlFetchLogSafe && f.urlFetchRequestSafe &&
+		!o.DirectoryBucket && !o.Decompress &&
+		!o.MightGzip.Value && o.UseAcceptEncodingGzip.Value &&
+		o.DownloadURL == "" && !o.RequesterPays &&
+		o.SSECustomerAlgorithm == "" && o.SSECustomerKey == "" &&
+		o.SSECustomerKeyBase64 == "" && o.SSECustomerKeyMD5 == "" &&
+		!o.V2Auth && o.Region != "other-v2-signature" &&
+		!o.Versions && !o.VersionAt.IsSet() && !o.NoHeadObject
+}
+
 // NewFs constructs an Fs from the path, bucket:path
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
@@ -1877,15 +2326,17 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	pc.SetRetries(2)
 
 	f := &Fs{
-		name:    name,
-		opt:     *opt,
-		ci:      ci,
-		ctx:     ctx,
-		c:       c,
-		pacer:   pc,
-		cache:   bucket.NewCache(),
-		srv:     srv,
-		srvRest: rest.NewClient(fshttp.NewClient(ctx)),
+		name:                name,
+		opt:                 *opt,
+		ci:                  ci,
+		ctx:                 ctx,
+		c:                   c,
+		pacer:               pc,
+		cache:               bucket.NewCache(),
+		srv:                 srv,
+		srvRest:             rest.NewClient(fshttp.NewClient(ctx)),
+		urlFetchLogSafe:     ci.Dump == 0 && opt.SDKLogMode == 0,
+		urlFetchRequestSafe: len(ci.Headers) == 0 && ci.ClientCert == "" && ci.ClientKey == "",
 	}
 	if opt.ServerSideEncryption == "aws:kms" || opt.SSECustomerAlgorithm != "" {
 		// From: https://docs.aws.amazon.com/AmazonS3/latest/API/RESTCommonResponseHeaders.html
@@ -1911,22 +2362,26 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	f.setRoot(root)
 	f.features = (&fs.Features{
-		ReadMimeType:      true,
-		WriteMimeType:     true,
-		ReadMetadata:      true,
-		WriteMetadata:     true,
-		UserMetadata:      true,
-		BucketBased:       true,
-		BucketBasedRootOK: true,
-		SetTier:           provider.StorageClass.Len() > 0,
-		GetTier:           provider.StorageClass.Len() > 0,
-		SlowModTime:       true,
+		ReadMimeType:       true,
+		WriteMimeType:      true,
+		ReadMetadata:       true,
+		WriteMetadata:      true,
+		UserMetadata:       true,
+		BucketBased:        true,
+		BucketBasedRootOK:  true,
+		SetTier:            provider.StorageClass.Len() > 0,
+		GetTier:            provider.StorageClass.Len() > 0,
+		SlowModTime:        true,
+		PublicLinkIsDirect: f.supportsDirectPublicLink(),
 	}).Fill(ctx, f)
 	if opt.Provider == "AWS" {
 		f.features.DoubleSlash = true
 	}
 	if opt.Provider == "Fastly" {
 		f.features.Copy = nil
+	}
+	if opt.Provider != "Fastly" || !f.urlFetchLogSafe || !f.urlFetchRequestSafe {
+		f.features.ServerSideFetchURL = nil
 	}
 	if opt.Provider == "Rabata" {
 		f.features.Copy = nil
@@ -5537,18 +5992,19 @@ func (o *Object) Metadata(ctx context.Context) (metadata fs.Metadata, err error)
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs              = &Fs{}
-	_ fs.Purger          = &Fs{}
-	_ fs.Copier          = &Fs{}
-	_ fs.PutStreamer     = &Fs{}
-	_ fs.ListRer         = &Fs{}
-	_ fs.ListPer         = &Fs{}
-	_ fs.Commander       = &Fs{}
-	_ fs.CleanUpper      = &Fs{}
-	_ fs.OpenChunkWriter = &Fs{}
-	_ fs.Object          = &Object{}
-	_ fs.MimeTyper       = &Object{}
-	_ fs.GetTierer       = &Object{}
-	_ fs.SetTierer       = &Object{}
-	_ fs.Metadataer      = &Object{}
+	_ fs.Fs                   = &Fs{}
+	_ fs.Purger               = &Fs{}
+	_ fs.Copier               = &Fs{}
+	_ fs.PutStreamer          = &Fs{}
+	_ fs.ListRer              = &Fs{}
+	_ fs.ListPer              = &Fs{}
+	_ fs.Commander            = &Fs{}
+	_ fs.CleanUpper           = &Fs{}
+	_ fs.OpenChunkWriter      = &Fs{}
+	_ fs.ServerSideFetchURLer = &Fs{}
+	_ fs.Object               = &Object{}
+	_ fs.MimeTyper            = &Object{}
+	_ fs.GetTierer            = &Object{}
+	_ fs.SetTierer            = &Object{}
+	_ fs.Metadataer           = &Object{}
 )
