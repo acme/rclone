@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -257,6 +258,34 @@ func TestDirectPublicLinkEligibility(t *testing.T) {
 	assert.True(t, fastly.Features().PublicLinkIsDirect)
 }
 
+func TestDirectPublicLinkEligibilityGCS(t *testing.T) {
+	ctx, _ := fs.AddConfig(context.Background())
+	f := newDirectFetchTestFs(ctx, t, "GCS", http.NotFoundHandler())
+	require.True(t, f.opt.MightGzip.Value)
+	require.False(t, f.opt.UseAcceptEncodingGzip.Value)
+	require.True(t, f.Features().PublicLinkIsDirect, "GCS content encoding is checked per object")
+	for _, tt := range []struct {
+		name   string
+		change func(*Fs)
+	}{
+		{"decompress", func(f *Fs) { f.opt.Decompress = true }},
+		{"download URL", func(f *Fs) { f.opt.DownloadURL = "https://cdn.example.invalid" }},
+		{"SSE-C algorithm", func(f *Fs) { f.opt.SSECustomerAlgorithm = "AES256" }},
+		{"V2", func(f *Fs) { f.opt.V2Auth = true }},
+		{"versions", func(f *Fs) { f.opt.Versions = true }},
+		{"no HEAD object", func(f *Fs) { f.opt.NoHeadObject = true }},
+		{"no system metadata", func(f *Fs) { f.opt.NoSystemMetadata = true }},
+		{"logging client", func(f *Fs) { f.urlFetchLogSafe = false }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			candidate := &Fs{opt: f.opt, urlFetchLogSafe: true, urlFetchRequestSafe: true}
+			require.True(t, candidate.supportsDirectPublicLink())
+			tt.change(candidate)
+			assert.False(t, candidate.supportsDirectPublicLink())
+		})
+	}
+}
+
 func TestDirectPublicLinkConstructor(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
@@ -268,6 +297,8 @@ func TestDirectPublicLinkConstructor(t *testing.T) {
 		{name: "AWS custom endpoint", provider: "AWS", want: true},
 		{name: "empty header slice", provider: "AWS", config: func(ci *fs.ConfigInfo) { ci.Headers = []*fs.HTTPOption{} }, want: true},
 		{name: "Fastly defaults", provider: "Fastly", want: true},
+		{name: "GCS defaults", provider: "GCS", want: true},
+		{name: "GCS decompress", provider: "GCS", values: configmap.Simple{"decompress": "true"}},
 		{name: "Fastly explicit no gzip", provider: "Fastly", values: configmap.Simple{"might_gzip": "false"}, want: true},
 		{name: "Fastly explicit might gzip", provider: "Fastly", values: configmap.Simple{"might_gzip": "true"}},
 		{name: "Other explicit no gzip", provider: "Other", values: configmap.Simple{"might_gzip": "false"}},
@@ -397,6 +428,7 @@ func TestDirectPublicLinkConfiguredPresigning(t *testing.T) {
 		{name: "Fastly", provider: "Fastly", values: configmap.Simple{"might_gzip": "false"}},
 		{name: "SSE-S3", provider: "AWS", values: configmap.Simple{"server_side_encryption": "AES256"}},
 		{name: "SSE-KMS", provider: "AWS", values: configmap.Simple{"server_side_encryption": "aws:kms", "sse_kms_key_id": "test-key-id"}},
+		{name: "GCS", provider: "GCS"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, ci := fs.AddConfig(context.Background())
@@ -417,6 +449,9 @@ func TestDirectPublicLinkConfiguredPresigning(t *testing.T) {
 			assert.Equal(t, "/bucket/file", u.Path)
 			assert.Equal(t, "86400", u.Query().Get("X-Amz-Expires"))
 			assert.Equal(t, "host", u.Query().Get("X-Amz-SignedHeaders"))
+			if tt.provider == "GCS" {
+				assert.False(t, u.Query().Has("x-id"), "GCS rejects the x-id parameter")
+			}
 			assert.Equal(t, int32(1), requests.Load())
 		})
 	}
@@ -540,6 +575,98 @@ func TestDirectFetchBoundary(t *testing.T) {
 			assert.Equal(t, http.MethodHead, (<-captures).request.Method)
 			assert.Empty(t, captures)
 		})
+	}
+}
+
+type fetchSourceMetadataError struct {
+	fetchSourceInfo
+	metadata func() error
+}
+
+func (s fetchSourceMetadataError) Metadata(context.Context) (fs.Metadata, error) {
+	return nil, s.metadata()
+}
+
+func TestDirectFetchSourceContentEncoding(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 1
+	sourceFs := func(provider string) fs.Info {
+		return newDirectFetchTestFs(ctx, t, provider, http.NotFoundHandler())
+	}
+	source := func(f fs.Info, metadata fs.Metadata) fetchSourceInfo {
+		return fetchSourceInfo{object.NewStaticObjectInfo("source.txt", time.Unix(10, 0), 7, true, nil, f).WithMetadata(metadata)}
+	}
+	gzipped := fs.Metadata{"content-encoding": "gzip"}
+	for _, tt := range []struct {
+		name     string
+		src      fs.ObjectInfo
+		wantCopy bool
+	}{
+		{name: "GCS source with Content-Encoding", src: source(sourceFs("GCS"), gzipped)},
+		{name: "unknown source with Content-Encoding", src: source(nil, gzipped)},
+		{name: "unknown source with other Content-Encoding", src: source(nil, fs.Metadata{"content-encoding": "br"})},
+		{name: "GCS source without Content-Encoding", src: source(sourceFs("GCS"), fs.Metadata{"owner": "test"}), wantCopy: true},
+		{name: "unknown source without metadata", src: source(nil, nil), wantCopy: true},
+		{name: "AWS source with Content-Encoding", src: source(sourceFs("AWS"), gzipped), wantCopy: true},
+		{name: "Fastly source with Content-Encoding", src: source(sourceFs("Fastly"), gzipped), wantCopy: true},
+		{name: "unreadable source metadata", src: fetchSourceMetadataError{source(nil, nil), func() error { return errors.New("metadata unavailable") }}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			captures := make(chan directFetchWireCapture, 2)
+			headSize := int64(7)
+			f := newDirectFetchTestFs(ctx, t, "Fastly", directFetchSuccessHandler(captures, &headSize))
+			got, err := f.ServerSideFetchURL(ctx, "target", "https://source.example/object", tt.src)
+			if !tt.wantCopy {
+				assert.Nil(t, got)
+				assert.ErrorIs(t, err, fs.ErrorCantCopy)
+				assert.Empty(t, captures, "a declined source must not reach the destination")
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, http.MethodPut, (<-captures).request.Method)
+			assert.Equal(t, http.MethodHead, (<-captures).request.Method)
+		})
+	}
+
+	t.Run("cancellation while reading metadata", func(t *testing.T) {
+		cancelCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		captures := make(chan directFetchWireCapture, 2)
+		f := newDirectFetchTestFs(ctx, t, "Fastly", directFetchSuccessHandler(captures, nil))
+		src := fetchSourceMetadataError{source(nil, nil), func() error { cancel(); return context.Canceled }}
+		got, err := f.ServerSideFetchURL(cancelCtx, "target", "https://source.example/object", src)
+		assert.Nil(t, got)
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.NotErrorIs(t, err, fs.ErrorCantCopy)
+		assert.Empty(t, captures)
+	})
+}
+
+func TestDirectFetchSourceEncodingReusesSourceHead(t *testing.T) {
+	for _, provider := range []string{"AWS", "GCS"} {
+		for _, serverModTime := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s server modtime %v", provider, serverModTime), func(t *testing.T) {
+				ctx, ci := fs.AddConfig(context.Background())
+				ci.LowLevelRetries = 1
+				ci.UseServerModTime = serverModTime
+				var heads atomic.Int32
+				srcFs := newDirectFetchTestFs(ctx, t, provider, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, http.MethodHead, r.Method)
+					heads.Add(1)
+					w.Header().Set("Content-Length", "7")
+					w.Header().Set("Last-Modified", "Wed, 01 Jan 2025 00:00:00 GMT")
+				}))
+				// A listed object whose metadata has not been read
+				src := &Object{fs: srcFs, remote: "file", bytes: 7}
+				captures := make(chan directFetchWireCapture, 2)
+				headSize := int64(7)
+				dst := newDirectFetchTestFs(ctx, t, "Fastly", directFetchSuccessHandler(captures, &headSize))
+				_, err := dst.ServerSideFetchURL(ctx, "target", "https://source.example/object", src)
+				require.NoError(t, err)
+				assert.Equal(t, int32(1), heads.Load(), "the encoding check must share the upload's source HEAD")
+			})
+		}
 	}
 }
 

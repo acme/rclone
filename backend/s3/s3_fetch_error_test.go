@@ -57,6 +57,14 @@ func TestDirectFetchFallbackStrictClassification(t *testing.T) {
 		{"rate limited", "PutObject", 429, "DirectFetchSourceStatus", "DirectFetchSourceStatus 503", false},
 		{"server error", "PutObject", 503, "DirectFetchSourceStatus", "DirectFetchSourceStatus 503", false},
 		{"unknown code", "PutObject", 400, "UnexpectedFailure", "DirectFetchSourceStatus 503", false},
+		{"missing source length", "PutObject", 400, "DirectFetchMissingContentLength", "DirectFetchMissingContentLength", true},
+		{"missing source length part", "UploadPart", 400, "DirectFetchMissingContentLength", "DirectFetchMissingContentLength", true},
+		{"missing source length wrong status", "PutObject", 403, "DirectFetchMissingContentLength", "DirectFetchMissingContentLength", false},
+		{"missing source length wrong code", "PutObject", 400, "InvalidRequest", "DirectFetchMissingContentLength", false},
+		{"missing source length without diagnostic", "PutObject", 400, "DirectFetchMissingContentLength", "", false},
+		{"missing source length mismatched diagnostic", "PutObject", 400, "DirectFetchMissingContentLength", "DirectFetchSourceStatus 503", false},
+		{"missing source length diagnostic suffix", "PutObject", 400, "DirectFetchMissingContentLength", "DirectFetchMissingContentLength extra", false},
+		{"missing source length complete operation", "CompleteMultipartUpload", 400, "DirectFetchMissingContentLength", "DirectFetchMissingContentLength", false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cause := fetchResponseError(tt.status, tt.code, tt.detail)

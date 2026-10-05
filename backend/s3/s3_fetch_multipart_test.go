@@ -349,6 +349,7 @@ func TestDirectFetchMultipartLogsProgressWithoutSecrets(t *testing.T) {
 	f := newDirectFetchTestFs(ctx, t, "Fastly", fixture)
 	f.opt.UploadCutoff = fs.SizeSuffix(size)
 	f.opt.ChunkSize = minChunkSize
+	f.opt.MaxUploadParts = 2
 	f.opt.UploadConcurrency = 1
 	sourceURL := "https://source.example/object?X-Amz-Signature=do-not-log"
 
@@ -357,9 +358,9 @@ func TestDirectFetchMultipartLogsProgressWithoutSecrets(t *testing.T) {
 	require.NotNil(t, got)
 
 	output := logs.String()
-	assert.Contains(t, output, "starting multipart upload with 3 parts")
-	assert.Contains(t, output, "part 1/3 (bytes=0-5242879) starting")
-	assert.Contains(t, output, "wrote part 1/3 (bytes=0-5242879) with 5242880 bytes")
+	assert.Contains(t, output, "starting multipart upload with 2 parts of size 5242881 bytes")
+	assert.Contains(t, output, "part 1/2 (bytes=0-5242880) starting")
+	assert.Contains(t, output, "wrote part 1/2 (bytes=0-5242880) with 5242881 bytes")
 	assert.Contains(t, output, "multipart upload finished")
 	assert.NotContains(t, output, sourceURL)
 	assert.NotContains(t, output, "do-not-log")

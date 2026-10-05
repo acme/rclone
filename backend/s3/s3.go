@@ -1419,8 +1419,9 @@ func directFetchFallback(err error) error {
 	var directErr *directFetchError
 	if errors.As(err, &directErr) &&
 		(directErr.operation == "PutObject" || directErr.operation == "UploadPart") &&
-		directErr.status == http.StatusBadRequest && directErr.code == "DirectFetchSourceStatus" &&
-		directFetchSourceStatus.MatchString(directErr.detail) {
+		directErr.status == http.StatusBadRequest &&
+		((directErr.code == "DirectFetchSourceStatus" && directFetchSourceStatus.MatchString(directErr.detail)) ||
+			(directErr.code == "DirectFetchMissingContentLength" && directErr.detail == "DirectFetchMissingContentLength")) {
 		return fmt.Errorf("%w: %w", fs.ErrorCantCopy, err)
 	}
 	return err
@@ -1441,6 +1442,26 @@ func (f *Fs) directFetchCall(ctx context.Context, operation, sourceURL string, c
 		err = wrapDirectFetchError(operation, sourceURL, err)
 		return f.shouldRetry(ctx, err)
 	})
+}
+
+// checkDirectFetchSourceEncoding returns an error wrapping fs.ErrorCantCopy
+// if the source URL might not return src as stored because it has a
+// Content-Encoding, for example GCS decompressive transcoding.
+func checkDirectFetchSourceEncoding(ctx context.Context, src fs.ObjectInfo) error {
+	if srcFs, ok := src.Fs().(*Fs); ok && srcFs.urlReturnsStoredBytes() {
+		return nil
+	}
+	metadata, err := fs.GetMetadata(ctx, src)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err != nil {
+		return fmt.Errorf("direct fetch could not read source metadata: %v: %w", err, fs.ErrorCantCopy)
+	}
+	if metadata["content-encoding"] != "" {
+		return fmt.Errorf("direct fetch requires a source without Content-Encoding: %w", fs.ErrorCantCopy)
+	}
+	return nil
 }
 
 // ServerSideFetchURL asks Fastly Object Storage to fetch sourceURL into remote.
@@ -1479,6 +1500,9 @@ func (f *Fs) ServerSideFetchURL(ctx context.Context, remote, sourceURL string, s
 	parsedSource, err := url.Parse(sourceURL)
 	if err != nil || (parsedSource.Scheme != "http" && parsedSource.Scheme != "https") || parsedSource.Host == "" || parsedSource.User != nil || parsedSource.Fragment != "" {
 		return nil, fmt.Errorf("direct fetch requires an HTTP(S) source URL without user information or a fragment: %w", fs.ErrorCantCopy)
+	}
+	if err := checkDirectFetchSourceEncoding(ctx, src); err != nil {
+		return nil, err
 	}
 
 	o := &Object{fs: f, remote: remote}
@@ -1523,7 +1547,7 @@ func (o *Object) fetchMultipart(ctx context.Context, sourceURL string, size int6
 		return nil, err
 	}
 	concurrency := max(1, o.fs.opt.UploadConcurrency)
-	fs.Debugf(o, "server-side URL fetch: starting multipart upload with %d parts of chunk size %v and concurrency %d", len(ranges), o.fs.opt.ChunkSize, concurrency)
+	fs.Debugf(o, "server-side URL fetch: starting multipart upload with %d parts of size %d bytes and concurrency %d", len(ranges), ranges[0].end-ranges[0].start+1, concurrency)
 
 	createReq := &s3.CreateMultipartUploadInput{}
 	setFrom_s3CreateMultipartUploadInput_s3PutObjectInput(createReq, req)
@@ -2259,13 +2283,32 @@ func (f *Fs) setRoot(root string) {
 	f.rootBucket, f.rootDirectory = bucket.Split(f.root)
 }
 
+// urlReturnsStoredBytes reports whether URL-only downloads return objects as stored, whatever their Content-Encoding.
+func (f *Fs) urlReturnsStoredBytes() bool {
+	return f.opt.Provider == "AWS" || f.opt.Provider == "Fastly"
+}
+
 // supportsDirectPublicLink reports whether URL-only downloads preserve logical bytes.
 func (f *Fs) supportsDirectPublicLink() bool {
 	o := &f.opt
-	return (o.Provider == "AWS" || o.Provider == "Fastly") &&
-		f.urlFetchLogSafe && f.urlFetchRequestSafe &&
+	switch {
+	case f.urlReturnsStoredBytes():
+		if o.MightGzip.Value || !o.UseAcceptEncodingGzip.Value {
+			return false
+		}
+	case o.Provider == "GCS":
+		// GCS may decompress objects stored with Content-Encoding, so
+		// ServerSideFetchURL declines those objects individually using
+		// the system metadata, which no_system_metadata hides.
+		// See: https://cloud.google.com/storage/docs/transcoding
+		if o.NoSystemMetadata {
+			return false
+		}
+	default:
+		return false
+	}
+	return f.urlFetchLogSafe && f.urlFetchRequestSafe &&
 		!o.DirectoryBucket && !o.Decompress &&
-		!o.MightGzip.Value && o.UseAcceptEncodingGzip.Value &&
 		o.DownloadURL == "" && !o.RequesterPays &&
 		o.SSECustomerAlgorithm == "" && o.SSECustomerKey == "" &&
 		o.SSECustomerKeyBase64 == "" && o.SSECustomerKeyMD5 == "" &&

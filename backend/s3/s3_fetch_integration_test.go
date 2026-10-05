@@ -28,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/config/configfile"
 	fslog "github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/operations"
@@ -42,7 +43,12 @@ const directFetchCopySourceURL = "https://source.example/object?X-Amz-Signature=
 
 type directFetchCopySourceObject struct {
 	*mockobject.ContentMockObject
-	opens atomic.Int32
+	opens    atomic.Int32
+	metadata fs.Metadata
+}
+
+func (o *directFetchCopySourceObject) Metadata(context.Context) (fs.Metadata, error) {
+	return o.metadata, nil
 }
 
 func (o *directFetchCopySourceObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
@@ -105,6 +111,12 @@ func (f *directFetchCopySDKFixture) ServeHTTP(w http.ResponseWriter, r *http.Req
 				w.Header().Set(directFetchErrorHeader, "DirectFetchSourceStatus 400")
 				w.WriteHeader(http.StatusBadRequest)
 				_, _ = io.WriteString(w, `<Error><Code>DirectFetchSourceStatus</Code><Message>400</Message></Error>`)
+				return
+			case "missing-length":
+				w.Header().Set("Content-Type", "application/xml")
+				w.Header().Set(directFetchErrorHeader, "DirectFetchMissingContentLength")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `<Error><Code>DirectFetchMissingContentLength</Code><Message>Source response missing content-length header</Message></Error>`)
 				return
 			case "auth":
 				w.Header().Set("Content-Type", "application/xml")
@@ -202,9 +214,13 @@ func TestDirectFetchCopyThroughS3SDK(t *testing.T) {
 		wantServerCopies int64
 		wantServerBytes  int64
 		wantLog          string
+		wantHeaderOnPut  []bool
+		metadata         fs.Metadata
 	}{
-		{name: "success", wantBytes: int64(len(payload)), wantServerCopies: 1, wantServerBytes: int64(len(payload)), wantLog: "Copied (server-side URL fetch)"},
-		{name: "source rejection falls back", mode: "fallback", wantError: false, wantOpens: 1, wantBytes: int64(len(payload)), wantLog: "Copied (new)"},
+		{name: "success", wantBytes: int64(len(payload)), wantServerCopies: 1, wantServerBytes: int64(len(payload)), wantLog: "Copied (server-side URL fetch)", wantHeaderOnPut: []bool{true}},
+		{name: "source rejection falls back", mode: "fallback", wantError: false, wantOpens: 1, wantBytes: int64(len(payload)), wantLog: "Copied (new)", wantHeaderOnPut: []bool{true, false}},
+		{name: "missing source length falls back", mode: "missing-length", wantOpens: 1, wantBytes: int64(len(payload)), wantLog: "Copied (new)", wantHeaderOnPut: []bool{true, false}},
+		{name: "content-encoded source uses ordinary copy", metadata: fs.Metadata{"content-encoding": "gzip"}, wantOpens: 1, wantBytes: int64(len(payload)), wantLog: "Copied (new)", wantHeaderOnPut: []bool{false}},
 		{name: "destination auth is final", mode: "auth", wantError: true},
 		{name: "cancellation is final", mode: "cancel", wantError: true},
 	} {
@@ -217,6 +233,7 @@ func TestDirectFetchCopyThroughS3SDK(t *testing.T) {
 			ctx = accounting.WithStatsGroup(ctx, group)
 			accounting.NewStatsGroup(ctx, group)
 			_, src := newDirectFetchCopySource(ctx, t, payload)
+			src.metadata = tc.metadata
 			fixture := &directFetchCopySDKFixture{mode: tc.mode, payload: payload, started: make(chan struct{})}
 			dst := newDirectFetchTestFs(ctx, t, "Fastly", fixture)
 
@@ -281,14 +298,14 @@ func TestDirectFetchCopyThroughS3SDK(t *testing.T) {
 			assert.Equal(t, payload, stored)
 			assert.Equal(t, payload, readDirectFetchCopyObject(ctx, t, got))
 			assert.Contains(t, logs, tc.wantLog)
-			require.NotEmpty(t, directBodies)
-			assert.Empty(t, directBodies[0], "Direct Fetch must use a body-free PutObject")
-			if tc.mode == "fallback" {
-				require.Equal(t, []bool{true, false}, headerOnPut)
+			require.Equal(t, tc.wantHeaderOnPut, headerOnPut)
+			for _, body := range directBodies {
+				assert.Empty(t, body, "Direct Fetch must use a body-free PutObject")
+			}
+			if tc.wantOpens > 0 {
 				require.Len(t, manualBodies, 1)
 				assert.Equal(t, payload, manualBodies[0])
 			} else {
-				assert.Equal(t, []bool{true}, headerOnPut)
 				assert.Empty(t, manualBodies)
 			}
 		})
@@ -301,6 +318,7 @@ func TestDirectFetchLive(t *testing.T) {
 	if sourceName == "" || destName == "" {
 		t.Skip("set explicit disposable source/destination paths to run Direct Fetch acceptance")
 	}
+	configfile.Install()
 	ctx, ci := fs.AddConfig(context.Background())
 	ci.LowLevelRetries = 1
 	source, err := fs.NewFs(ctx, sourceName)
@@ -345,14 +363,15 @@ func runDirectFetchLiveCases(t *testing.T, ctx context.Context, source, dest fs.
 	require.NoError(t, err)
 	require.NoError(t, zw.Close())
 	cases := []struct {
-		name    string
-		data    []byte
-		options []fs.OpenOption
+		name           string
+		data           []byte
+		options        []fs.OpenOption
+		contentEncoded bool
 	}{
 		{name: "zero", data: nil},
 		{name: "binary", data: []byte{0, 1, 2, 127, 128, 255}},
 		{name: "text", data: []byte("Direct Fetch acceptance\n")},
-		{name: "gzip", data: compressed.Bytes(), options: []fs.OpenOption{
+		{name: "gzip", data: compressed.Bytes(), contentEncoded: true, options: []fs.OpenOption{
 			&fs.HTTPOption{Key: "Content-Encoding", Value: "gzip"},
 		}},
 	}
@@ -374,6 +393,13 @@ func runDirectFetchLiveCases(t *testing.T, ctx context.Context, source, dest fs.
 			}
 			stats, err := accounting.Stats(testCtx).RemoteStats(false)
 			directFetchLiveRequireNoError(t, err, "stats read")
+			if tc.contentEncoded && !source.(*Fs).urlReturnsStoredBytes() {
+				// The source may transcode content-encoded objects, so these
+				// take the ordinary copy, whose handling of them is not
+				// specific to Direct Fetch.
+				assert.EqualValues(t, 0, stats["serverSideCopies"])
+				return
+			}
 			assert.EqualValues(t, 1, stats["serverSideCopies"])
 			assert.Equal(t, info.Size(), out.Size())
 			assert.WithinDuration(t, info.ModTime(testCtx), out.ModTime(testCtx), time.Second)
