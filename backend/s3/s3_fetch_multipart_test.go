@@ -307,15 +307,16 @@ func directFetchMultipartCaptures(captures []directFetchWireCapture, method stri
 	return filtered
 }
 
-func TestDirectFetchMultipartUsesUploadCutoff(t *testing.T) {
+func TestDirectFetchMultipartUsesDirectFetchChunkSize(t *testing.T) {
 	ctx, ci := fs.AddConfig(context.Background())
 	ci.LowLevelRetries = 1
 	size := 2*int64(minChunkSize) + 1
 	fixture := &directFetchMultipartFixture{headSize: size}
 	f := newDirectFetchTestFs(ctx, t, "Fastly", fixture)
-	f.opt.UploadCutoff = fs.SizeSuffix(size)
-	f.opt.ChunkSize = minChunkSize
-	f.opt.UploadConcurrency = 1
+	f.opt.UploadCutoff = maxUploadCutoff
+	f.opt.ChunkSize = fs.SizeSuffix(directFetchMaxSize)
+	f.opt.DirectFetchChunkSize = minChunkSize
+	f.opt.DirectFetchConcurrency = 1
 
 	got, err := f.ServerSideFetchURL(ctx, "target", "https://source.example/object", directFetchSource(size, nil))
 	require.NoError(t, err)
@@ -329,6 +330,79 @@ func TestDirectFetchMultipartUsesUploadCutoff(t *testing.T) {
 	assertDirectFetchWireRequest(t, puts[1], "https://source.example/object", fmt.Sprintf("bytes=%d-%d", minChunkSize, 2*int64(minChunkSize)-1))
 	assertDirectFetchWireRequest(t, puts[2], "https://source.example/object", fmt.Sprintf("bytes=%d-%d", 2*int64(minChunkSize), size-1))
 	assert.Len(t, completedParts, 3)
+}
+
+func TestDirectFetchSinglePartUpToDirectFetchChunkSize(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 1
+	size := int64(minChunkSize)
+	captures := make(chan directFetchWireCapture, 4)
+	f := newDirectFetchTestFs(ctx, t, "Fastly", directFetchSuccessHandler(captures, &size))
+	f.opt.UploadCutoff = 0
+	f.opt.DirectFetchChunkSize = minChunkSize
+
+	got, err := f.ServerSideFetchURL(ctx, "target", "https://source.example/object", directFetchSource(size, nil))
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	put := <-captures
+	assert.Equal(t, http.MethodPut, put.request.Method)
+	assert.False(t, put.request.URL.Query().Has("uploadId"))
+	assert.Equal(t, http.MethodHead, (<-captures).request.Method)
+	assert.Empty(t, captures)
+}
+
+func TestDirectFetchMultipartUsesDirectFetchConcurrency(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 1
+	const concurrency = 3
+	size := 4 * int64(minChunkSize)
+	fixture := &directFetchMultipartFixture{headSize: size}
+	var mu sync.Mutex
+	started := 0
+	allStarted := make(chan struct{})
+	fixture.partHook = func(w http.ResponseWriter, _ *http.Request, part int) {
+		mu.Lock()
+		started++
+		if started == concurrency {
+			close(allStarted)
+		}
+		mu.Unlock()
+		select {
+		case <-allStarted:
+		case <-time.After(5 * time.Second):
+		}
+		w.Header().Set("ETag", fmt.Sprintf(`"part-%d"`, part))
+	}
+	f := newDirectFetchTestFs(ctx, t, "Fastly", fixture)
+	f.opt.UploadConcurrency = 1
+	f.opt.DirectFetchChunkSize = minChunkSize
+	f.opt.DirectFetchConcurrency = concurrency
+
+	got, err := f.ServerSideFetchURL(ctx, "target", "https://source.example/object", directFetchSource(size, nil))
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	_, _, completedParts, maxActive := fixture.snapshot()
+	assert.Len(t, completedParts, 4)
+	assert.Equal(t, concurrency, maxActive)
+}
+
+func TestDirectFetchOptions(t *testing.T) {
+	ctx := context.Background()
+	f := newDirectFetchTestFs(ctx, t, "Fastly", http.NotFoundHandler())
+	assert.Equal(t, 64*fs.Mebi, f.opt.DirectFetchChunkSize)
+	assert.Equal(t, 16, f.opt.DirectFetchConcurrency)
+
+	reg, err := fs.Find("s3")
+	require.NoError(t, err)
+	m := fs.ConfigMap("s3", reg.Options, "direct-fetch-test", configmap.Simple{
+		"provider":                "Fastly",
+		"env_auth":                "false",
+		"direct_fetch_chunk_size": "1Mi",
+	})
+	_, err = NewFs(ctx, "direct-fetch-test", "bucket", m)
+	assert.ErrorContains(t, err, "direct fetch chunk size")
 }
 
 func TestDirectFetchMultipartLogsProgressWithoutSecrets(t *testing.T) {
@@ -347,10 +421,9 @@ func TestDirectFetchMultipartLogsProgressWithoutSecrets(t *testing.T) {
 	size := 2*int64(minChunkSize) + 1
 	fixture := &directFetchMultipartFixture{headSize: size}
 	f := newDirectFetchTestFs(ctx, t, "Fastly", fixture)
-	f.opt.UploadCutoff = fs.SizeSuffix(size)
-	f.opt.ChunkSize = minChunkSize
+	f.opt.DirectFetchChunkSize = minChunkSize
 	f.opt.MaxUploadParts = 2
-	f.opt.UploadConcurrency = 1
+	f.opt.DirectFetchConcurrency = 1
 	sourceURL := "https://source.example/object?X-Amz-Signature=do-not-log"
 
 	got, err := f.ServerSideFetchURL(ctx, "target", sourceURL, directFetchSource(size, nil))
@@ -392,12 +465,12 @@ func TestDirectFetchMultipartSuccess(t *testing.T) {
 		}
 	}
 	f := newDirectFetchTestFsWithConfig(ctx, t, "Fastly", fixture, configmap.Simple{
-		"server_side_encryption": "AES256",
-		"storage_class":          "STANDARD_IA",
-		"requester_pays":         "true",
-		"sse_customer_algorithm": "AES256",
-		"chunk_size":             strconv.FormatInt(directFetchMaxSize, 10),
-		"upload_concurrency":     "2",
+		"server_side_encryption":   "AES256",
+		"storage_class":            "STANDARD_IA",
+		"requester_pays":           "true",
+		"sse_customer_algorithm":   "AES256",
+		"direct_fetch_chunk_size":  strconv.FormatInt(directFetchMaxSize, 10),
+		"direct_fetch_concurrency": "2",
 	})
 	f.opt.Versions = true
 	require.True(t, f.opt.UseMultipartUploads.Value)
@@ -582,8 +655,8 @@ func TestDirectFetchMultipartFailureCleanup(t *testing.T) {
 			ci.LowLevelRetries = 1
 			fixture := &directFetchMultipartFixture{headSize: directFetchMaxSize + 1}
 			f := newDirectFetchTestFs(ctx, t, "Fastly", fixture)
-			f.opt.ChunkSize = fs.SizeSuffix(directFetchMaxSize)
-			f.opt.UploadConcurrency = 1
+			f.opt.DirectFetchChunkSize = fs.SizeSuffix(directFetchMaxSize)
+			f.opt.DirectFetchConcurrency = 1
 			tt.configure(fixture, f)
 
 			got, err := f.ServerSideFetchURL(ctx, "target", "https://source.example/large",
@@ -624,7 +697,7 @@ func TestDirectFetchMultipartImpossiblePlanDoesNotCreate(t *testing.T) {
 	ctx, _ := fs.AddConfig(context.Background())
 	fixture := &directFetchMultipartFixture{}
 	f := newDirectFetchTestFs(ctx, t, "Fastly", fixture)
-	f.opt.ChunkSize = minChunkSize
+	f.opt.DirectFetchChunkSize = minChunkSize
 	f.opt.MaxUploadParts = maxUploadParts
 
 	got, err := f.ServerSideFetchURL(ctx, "target", "https://source.example/impossible", directFetchSource(math.MaxInt64, nil))
@@ -658,8 +731,8 @@ func TestDirectFetchMultipartFailurePreservesPrimaryAndAbortCauses(t *testing.T)
 	ci.LowLevelRetries = 1
 	fixture := &directFetchMultipartFixture{headSize: directFetchMaxSize + 1}
 	f := newDirectFetchTestFs(ctx, t, "Fastly", fixture)
-	f.opt.ChunkSize = fs.SizeSuffix(directFetchMaxSize)
-	f.opt.UploadConcurrency = 1
+	f.opt.DirectFetchChunkSize = fs.SizeSuffix(directFetchMaxSize)
+	f.opt.DirectFetchConcurrency = 1
 	primaryErr := errors.New("primary upload sentinel")
 	abortErr := errors.New("abort sentinel")
 	options := f.c.Options()
@@ -703,8 +776,8 @@ func TestDirectFetchCancelAbortsAfterWorkersWithIndependentDeadline(t *testing.T
 		<-r.Context().Done()
 	}
 	f := newDirectFetchTestFs(baseCtx, t, "Fastly", fixture)
-	f.opt.ChunkSize = fs.SizeSuffix(directFetchMaxSize)
-	f.opt.UploadConcurrency = 1
+	f.opt.DirectFetchChunkSize = fs.SizeSuffix(directFetchMaxSize)
+	f.opt.DirectFetchConcurrency = 1
 	options := f.c.Options()
 	partTransportDone := make(chan struct{})
 	deleteObserved := make(chan struct{})
@@ -762,8 +835,8 @@ func TestDirectFetchMultipartConcurrentCallsWithoutAccounting(t *testing.T) {
 	ci.LowLevelRetries = 1
 	fixture := &directFetchMultipartFixture{headSize: directFetchMaxSize + 1}
 	f := newDirectFetchTestFs(ctx, t, "Fastly", fixture)
-	f.opt.ChunkSize = fs.SizeSuffix(directFetchMaxSize)
-	f.opt.UploadConcurrency = 2
+	f.opt.DirectFetchChunkSize = fs.SizeSuffix(directFetchMaxSize)
+	f.opt.DirectFetchConcurrency = 2
 	sharedDummyStarted := directFetchNullAccounter.Started()
 
 	const transfers = 8

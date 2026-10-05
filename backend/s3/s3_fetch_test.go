@@ -560,7 +560,7 @@ func TestDirectFetchBoundary(t *testing.T) {
 			captures := make(chan directFetchWireCapture, 2)
 			headSize := tt.size
 			f := newDirectFetchTestFs(ctx, t, "Fastly", directFetchSuccessHandler(captures, &headSize))
-			f.opt.UploadCutoff = fs.SizeSuffix(directFetchMaxSize + 1)
+			f.opt.DirectFetchChunkSize = fs.SizeSuffix(directFetchMaxSize)
 			got, err := f.ServerSideFetchURL(ctx, "target", "https://source.example/object", directFetchSource(tt.size, nil))
 			if !tt.wantCopy {
 				assert.Nil(t, got)

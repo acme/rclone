@@ -497,12 +497,12 @@ func runDirectFetchLiveErrorCases(ctx context.Context, t *testing.T, source, des
 		if !ok {
 			t.Fatal("source link did not contain the expected signature field")
 		}
-		oldChunkSize, oldConcurrency := dest.opt.ChunkSize, dest.opt.UploadConcurrency
-		dest.opt.ChunkSize = fs.SizeSuffix(directFetchMaxSize)
-		dest.opt.UploadConcurrency = 1
+		oldChunkSize, oldConcurrency := dest.opt.DirectFetchChunkSize, dest.opt.DirectFetchConcurrency
+		dest.opt.DirectFetchChunkSize = fs.SizeSuffix(directFetchMaxSize)
+		dest.opt.DirectFetchConcurrency = 1
 		defer func() {
-			dest.opt.ChunkSize = oldChunkSize
-			dest.opt.UploadConcurrency = oldConcurrency
+			dest.opt.DirectFetchChunkSize = oldChunkSize
+			dest.opt.DirectFetchConcurrency = oldConcurrency
 		}()
 		synthetic := object.NewStaticObjectInfo(name, src.ModTime(ctx), directFetchMaxSize+1, true, nil, source)
 		got, fetchErr := dest.ServerSideFetchURL(ctx, name, corruptURL, synthetic)

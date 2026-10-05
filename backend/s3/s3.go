@@ -366,6 +366,32 @@ this may help to speed up the transfers.`,
 			Default:  4,
 			Advanced: true,
 		}, {
+			Name: "direct_fetch_chunk_size",
+			Help: `Part size for Direct Fetch copies to Fastly Object Storage.
+
+Objects larger than this are fetched as a multipart upload in parts of
+this size. Objects up to this size are fetched in a single request.
+
+Direct Fetch parts are not buffered by rclone, so unlike chunk_size
+this does not affect memory use.
+
+Rclone will automatically increase the part size to stay below the
+max_upload_parts limit. The minimum is 5 MiB.`,
+			Default:  64 * fs.Mebi,
+			Advanced: true,
+		}, {
+			Name: "direct_fetch_concurrency",
+			Help: `Concurrency for Direct Fetch copies to Fastly Object Storage.
+
+This is the number of parts of the same object that Fastly Object
+Storage is asked to fetch concurrently. Each transfer has its own
+parts in flight, so the total is this multiplied by --transfers.
+
+Direct Fetch parts are not buffered by rclone, so unlike
+upload_concurrency this does not affect memory use.`,
+			Default:  16,
+			Advanced: true,
+		}, {
 			Name: "force_path_style",
 			Help: `If true use path style access if false use virtual hosted style.
 
@@ -1107,6 +1133,8 @@ type Options struct {
 	RoleSessionDuration         fs.Duration          `config:"role_session_duration"`
 	RoleExternalID              string               `config:"role_external_id"`
 	UploadConcurrency           int                  `config:"upload_concurrency"`
+	DirectFetchChunkSize        fs.SizeSuffix        `config:"direct_fetch_chunk_size"`
+	DirectFetchConcurrency      int                  `config:"direct_fetch_concurrency"`
 	ForcePathStyle              bool                 `config:"force_path_style"`
 	V2Auth                      bool                 `config:"v2_auth"`
 	UseAccelerateEndpoint       bool                 `config:"use_accelerate_endpoint"`
@@ -1516,7 +1544,7 @@ func (f *Fs) ServerSideFetchURL(ctx context.Context, remote, sourceURL string, s
 	ui.req.Body = nil
 	ui.req.ContentLength = aws.Int64(0)
 	ui.req.ContentMD5 = nil
-	if size > directFetchMaxSize || (size > 0 && size >= int64(f.opt.UploadCutoff)) {
+	if size > directFetchMaxSize || size > int64(f.opt.DirectFetchChunkSize) {
 		versionID, err := o.fetchMultipart(ctx, sourceURL, size, ui.req)
 		if err != nil {
 			return nil, err
@@ -1542,11 +1570,11 @@ func (f *Fs) ServerSideFetchURL(ctx context.Context, remote, sourceURL string, s
 }
 
 func (o *Object) fetchMultipart(ctx context.Context, sourceURL string, size int64, req *s3.PutObjectInput) (versionID *string, err error) {
-	ranges, err := directFetchRanges(size, o.fs.opt.ChunkSize, o.fs.opt.MaxUploadParts)
+	ranges, err := directFetchRanges(size, o.fs.opt.DirectFetchChunkSize, o.fs.opt.MaxUploadParts)
 	if err != nil {
 		return nil, err
 	}
-	concurrency := max(1, o.fs.opt.UploadConcurrency)
+	concurrency := max(1, o.fs.opt.DirectFetchConcurrency)
 	fs.Debugf(o, "server-side URL fetch: starting multipart upload with %d parts of size %d bytes and concurrency %d", len(ranges), ranges[0].end-ranges[0].start+1, concurrency)
 
 	createReq := &s3.CreateMultipartUploadInput{}
@@ -2331,6 +2359,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	err = checkUploadCutoff(opt.UploadCutoff)
 	if err != nil {
 		return nil, fmt.Errorf("s3: upload cutoff: %w", err)
+	}
+	err = checkUploadChunkSize(opt.DirectFetchChunkSize)
+	if err != nil {
+		return nil, fmt.Errorf("s3: direct fetch chunk size: %w", err)
 	}
 	err = checkCopyCutoff(opt.CopyCutoff)
 	if err != nil {
