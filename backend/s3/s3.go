@@ -28,6 +28,7 @@ import (
 	"unicode"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	v4signer "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -1227,6 +1228,10 @@ type Object struct {
 	contentEncoding    *string // Content-Encoding: header
 	contentLanguage    *string // Content-Language: header
 
+	// Content-Encoding GCS stored the object with, set when GCS
+	// decompressed the response and so omitted Content-Encoding
+	storedContentEncoding string
+
 	// Object Lock metadata
 	objectLockMode            *string    // Object Lock mode: GOVERNANCE or COMPLIANCE
 	objectLockRetainUntilDate *time.Time // Object Lock retention until date
@@ -1488,6 +1493,9 @@ func checkDirectFetchSourceEncoding(ctx context.Context, src fs.ObjectInfo) erro
 	}
 	if metadata["content-encoding"] != "" {
 		return fmt.Errorf("direct fetch requires a source without Content-Encoding: %w", fs.ErrorCantCopy)
+	}
+	if o, ok := src.(*Object); ok && o.storedContentEncoding != "" {
+		return fmt.Errorf("direct fetch requires a source stored without Content-Encoding: %w", fs.ErrorCantCopy)
 	}
 	return nil
 }
@@ -2332,7 +2340,9 @@ func (f *Fs) supportsDirectPublicLink() bool {
 	case o.Provider == "GCS":
 		// GCS may decompress objects stored with Content-Encoding, so
 		// ServerSideFetchURL declines those objects individually using
-		// the system metadata, which no_system_metadata hides.
+		// X-Goog-Stored-Content-Encoding, as GCS omits Content-Encoding
+		// when it decompresses. no_system_metadata also hides the
+		// Content-Encoding check, so decline it to stay conservative.
 		// See: https://cloud.google.com/storage/docs/transcoding
 		if o.NoSystemMetadata {
 			return false
@@ -4819,6 +4829,13 @@ func (o *Object) setMetaData(resp *s3.HeadObjectOutput) {
 	o.contentDisposition = stringClonePointer(resp.ContentDisposition)
 	o.contentEncoding = stringClonePointer(removeAWSChunked(resp.ContentEncoding))
 	o.contentLanguage = stringClonePointer(resp.ContentLanguage)
+	o.storedContentEncoding = ""
+	if raw, ok := awsmiddleware.GetRawResponse(resp.ResultMetadata).(*smithyhttp.Response); ok && raw.Response != nil {
+		// Not exposed by the SDK. See: https://cloud.google.com/storage/docs/transcoding
+		if encoding := raw.Header.Get("X-Goog-Stored-Content-Encoding"); encoding != "identity" {
+			o.storedContentEncoding = encoding
+		}
+	}
 
 	// Set Object Lock metadata
 	if resp.ObjectLockMode != "" {

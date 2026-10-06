@@ -398,6 +398,8 @@ func runDirectFetchLiveCases(t *testing.T, ctx context.Context, source, dest fs.
 				// take the ordinary copy, whose handling of them is not
 				// specific to Direct Fetch.
 				assert.EqualValues(t, 0, stats["serverSideCopies"])
+				assert.ErrorIs(t, checkDirectFetchSourceEncoding(testCtx, src), fs.ErrorCantCopy,
+					"the source check, not a destination error, must decline")
 				return
 			}
 			assert.EqualValues(t, 1, stats["serverSideCopies"])

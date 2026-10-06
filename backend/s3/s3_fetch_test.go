@@ -670,6 +670,84 @@ func TestDirectFetchSourceEncodingReusesSourceHead(t *testing.T) {
 	}
 }
 
+// gcsSourceHandler serves HEAD and GET as GCS does through its S3 API
+// when the request does not accept gzip. It decompresses the "gzipped"
+// object, which is stored with Content-Encoding: gzip, and serves any
+// other object as stored.
+func gcsSourceHandler(w http.ResponseWriter, r *http.Request) {
+	const body = "Direct Fetch gzip\n"
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Last-Modified", "Wed, 01 Jan 2025 00:00:00 GMT")
+	if strings.HasSuffix(r.URL.Path, "/gzipped") {
+		w.Header().Set("ETag", `W/"88dd0c6d7d2757a49f8a3007fcaf8d96"`)
+		w.Header().Set("Vary", "Accept-Encoding")
+		w.Header().Set("Warning", "214 UploadServer gunzipped")
+		w.Header().Set("X-Goog-Stored-Content-Encoding", "gzip")
+		w.Header().Set("X-Goog-Stored-Content-Length", "39")
+		w.Header().Set("X-Guploader-Response-Body-Transformations", "gunzipped")
+		if r.Method == http.MethodGet {
+			// Chunked, so no Content-Length, as GCS sends it
+			w.(http.Flusher).Flush()
+			_, _ = io.WriteString(w, body)
+		}
+		return
+	}
+	w.Header().Set("ETag", `"0c1f3bfa7ef7b0ad8ee3b0ba0f6d5c2b"`)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.Header().Set("X-Goog-Stored-Content-Encoding", "identity")
+	w.Header().Set("X-Goog-Stored-Content-Length", strconv.Itoa(len(body)))
+	if r.Method == http.MethodGet {
+		_, _ = io.WriteString(w, body)
+	}
+}
+
+func TestDirectFetchSourceGCSTranscoding(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 1
+	srcFs := newDirectFetchTestFs(ctx, t, "GCS", http.HandlerFunc(gcsSourceHandler))
+	listed := func(t *testing.T, remote string, size int64) fs.ObjectInfo {
+		return &Object{fs: srcFs, remote: remote, bytes: size}
+	}
+	opened := func(t *testing.T, remote string, size int64) fs.ObjectInfo {
+		o := &Object{fs: srcFs, remote: remote, bytes: size}
+		in, err := o.Open(ctx)
+		require.NoError(t, err)
+		_, err = io.Copy(io.Discard, in)
+		require.NoError(t, err)
+		require.NoError(t, in.Close())
+		return o
+	}
+	for _, tt := range []struct {
+		name     string
+		src      func(t *testing.T, remote string, size int64) fs.ObjectInfo
+		remote   string
+		size     int64
+		wantCopy bool
+	}{
+		{name: "listed gzipped", src: listed, remote: "gzipped", size: 39},
+		{name: "opened gzipped", src: opened, remote: "gzipped", size: 39},
+		{name: "listed plain", src: listed, remote: "plain", size: 18, wantCopy: true},
+		{name: "opened plain", src: opened, remote: "plain", size: 18, wantCopy: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			captures := make(chan directFetchWireCapture, 2)
+			headSize := tt.size
+			dst := newDirectFetchTestFs(ctx, t, "Fastly", directFetchSuccessHandler(captures, &headSize))
+			got, err := dst.ServerSideFetchURL(ctx, "target", "https://source.example/object", tt.src(t, tt.remote, tt.size))
+			if !tt.wantCopy {
+				assert.Nil(t, got)
+				assert.ErrorIs(t, err, fs.ErrorCantCopy)
+				assert.Empty(t, captures, "a transcoded source must not reach the destination")
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, http.MethodPut, (<-captures).request.Method)
+			assert.Equal(t, http.MethodHead, (<-captures).request.Method)
+		})
+	}
+}
+
 func TestDirectFetchPreflight(t *testing.T) {
 	sourceURL := "https://source.example/object"
 	src := directFetchSource(7, nil)
