@@ -1534,6 +1534,9 @@ func (f *Fs) ServerSideFetchURL(ctx context.Context, remote, sourceURL string, s
 	}
 
 	o := &Object{fs: f, remote: remote}
+	// noHash because rclone never sees the bytes and doesn't pin the
+	// source, so storing src's MD5 could make a corrupted copy pass a
+	// hash check
 	ui, err := o.prepareUpload(ctx, src, options, true)
 	if err != nil {
 		return nil, err
