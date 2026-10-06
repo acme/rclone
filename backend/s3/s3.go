@@ -389,7 +389,7 @@ Storage is asked to fetch concurrently. Each transfer has its own
 parts in flight, so the total is this multiplied by --transfers.
 
 Direct Fetch parts are not buffered by rclone, so unlike
-upload_concurrency this does not affect memory use.`,
+upload_concurrency this has a negligible effect on memory use.`,
 			Default:  16,
 			Advanced: true,
 		}, {
