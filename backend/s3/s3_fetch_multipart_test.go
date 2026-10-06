@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/xml"
@@ -11,9 +12,12 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -828,6 +832,66 @@ func TestDirectFetchCancelAbortsAfterWorkersWithIndependentDeadline(t *testing.T
 	assert.Contains(t, events, "abort")
 	assert.Empty(t, directFetchMultipartEvents(events, "complete"))
 	assert.Empty(t, directFetchMultipartEvents(events, "head"))
+}
+
+func TestDirectFetchMultipartAbortsOnSignal(t *testing.T) {
+	if os.Getenv("RCLONE_TEST_DIRECT_FETCH_SIGNAL") != "" {
+		runDirectFetchUntilSignalled(t)
+		return
+	}
+	if runtime.GOOS == "windows" || runtime.GOOS == "plan9" {
+		t.Skip("needs SIGTERM")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	// the atexit signal handler calls os.Exit, so signal a child process
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDirectFetchMultipartAbortsOnSignal$")
+	cmd.Env = append(os.Environ(), "RCLONE_TEST_DIRECT_FETCH_SIGNAL=1")
+	stdout, err := cmd.StdoutPipe()
+	require.NoError(t, err)
+	require.NoError(t, cmd.Start())
+	var lines []string
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+		if scanner.Text() == "part started" {
+			require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
+		}
+	}
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, cmd.Wait(), &exitErr)
+	// 128+SIGTERM is the exit code the atexit signal handler uses
+	assert.Equal(t, 143, exitErr.ExitCode())
+	assert.Contains(t, lines, "part started")
+	assert.Contains(t, lines, "aborted")
+}
+
+// runDirectFetchUntilSignalled starts a multipart Direct Fetch whose
+// parts never finish, printing progress for TestDirectFetchMultipartAbortsOnSignal.
+func runDirectFetchUntilSignalled(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.LowLevelRetries = 1
+	fixture := &directFetchMultipartFixture{headSize: 2*directFetchMaxSize + 1}
+	fixture.partHook = func(_ http.ResponseWriter, r *http.Request, _ int) {
+		fmt.Println("part started")
+		<-r.Context().Done()
+	}
+	f := newDirectFetchTestFs(ctx, t, "Fastly", fixture)
+	f.opt.DirectFetchChunkSize = fs.SizeSuffix(directFetchMaxSize)
+	f.opt.DirectFetchConcurrency = 1
+	options := f.c.Options()
+	baseHTTPClient := options.HTTPClient
+	options.HTTPClient = directFetchHTTPClientFunc(func(request *http.Request) (*http.Response, error) {
+		response, err := baseHTTPClient.Do(request)
+		if request.Method == http.MethodDelete && err == nil && response.StatusCode < 300 {
+			fmt.Println("aborted")
+		}
+		return response, err
+	})
+	f.c = awss3.New(options)
+	_, err := f.ServerSideFetchURL(ctx, "target", "https://source.example/signal",
+		directFetchSource(2*directFetchMaxSize+1, nil))
+	t.Fatalf("fetch returned without being signalled: %v", err)
 }
 
 func TestDirectFetchMultipartConcurrentCallsWithoutAccounting(t *testing.T) {

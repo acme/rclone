@@ -1595,17 +1595,11 @@ func (o *Object) fetchMultipart(ctx context.Context, sourceURL string, size int6
 		return nil, errors.New("direct fetch multipart creation returned no upload ID")
 	}
 	uploadID := createOut.UploadId
-	completed := false
+	var abortErr error
 	defer func() {
-		if completed {
+		if err == nil {
 			return
 		}
-		abortErr := o.fs.abortDirectFetch(ctx, &s3.AbortMultipartUploadInput{
-			Bucket:       req.Bucket,
-			Key:          req.Key,
-			UploadId:     uploadID,
-			RequestPayer: req.RequestPayer,
-		}, sourceURL)
 		if ctx.Err() != nil {
 			err = errors.Join(ctx.Err(), err)
 		}
@@ -1617,6 +1611,15 @@ func (o *Object) fetchMultipart(ctx context.Context, sourceURL string, size int6
 			err = directFetchFallback(err)
 		}
 	}()
+	// Deferred functions don't run when rclone exits on a signal
+	defer atexit.OnError(&err, func() {
+		abortErr = o.fs.abortDirectFetch(ctx, &s3.AbortMultipartUploadInput{
+			Bucket:       req.Bucket,
+			Key:          req.Key,
+			UploadId:     uploadID,
+			RequestPayer: req.RequestPayer,
+		}, sourceURL)
+	})()
 
 	parts := make([]types.CompletedPart, len(ranges))
 	account := transferaccounter.Get(ctx)
@@ -1705,7 +1708,6 @@ func (o *Object) fetchMultipart(ctx context.Context, sourceURL string, size int6
 	if completeOut == nil || completeOut.ETag == nil || *completeOut.ETag == "" {
 		return nil, errors.New("direct fetch multipart completion returned no ETag")
 	}
-	completed = true
 	fs.Debugf(o, "server-side URL fetch multipart upload finished")
 	return completeOut.VersionId, nil
 }
