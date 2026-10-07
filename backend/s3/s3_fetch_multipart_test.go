@@ -527,8 +527,8 @@ func TestDirectFetchMultipartSuccess(t *testing.T) {
 	for _, put := range puts {
 		byPart[put.request.URL.Query().Get("partNumber")] = put
 	}
-	assertDirectFetchWireRequest(t, byPart["1"], sourceURL, "bytes=0-4999999999")
-	assertDirectFetchWireRequest(t, byPart["2"], sourceURL, "bytes=5000000000-5000000000")
+	assertDirectFetchWireRequest(t, byPart["1"], sourceURL, "bytes=0-5368709119")
+	assertDirectFetchWireRequest(t, byPart["2"], sourceURL, "bytes=5368709120-5368709120")
 	for _, put := range puts {
 		assert.Equal(t, "requester", put.request.Header.Get("X-Amz-Request-Payer"))
 		assert.Equal(t, "AES256", put.request.Header.Get("X-Amz-Server-Side-Encryption-Customer-Algorithm"))

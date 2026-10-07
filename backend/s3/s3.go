@@ -1302,7 +1302,7 @@ func (f *Fs) Features() *fs.Features {
 const (
 	directFetchSourceHeader   = "fastly-object-storage-source-url"
 	directFetchErrorHeader    = "fastly-object-storage-df-error"
-	directFetchMaxSize        = int64(5_000_000_000)
+	directFetchMaxSize        = int64(5 * fs.Gibi)
 	directFetchCleanupTimeout = 60 * time.Second
 )
 
